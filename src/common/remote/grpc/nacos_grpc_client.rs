@@ -17,6 +17,7 @@ use super::nacos_grpc_connection::{NacosGrpcConnection, SendRequest};
 use super::nacos_grpc_service::{
     DynamicBiStreamingCallLayer, DynamicBiStreamingCallLayerWrapper, DynamicUnaryCallLayer,
 };
+use super::task_group::{TaskGroup, TaskOwner};
 use super::tonic::TonicBuilder;
 use super::{config::GrpcConfiguration, nacos_grpc_service::ServerRequestHandler};
 
@@ -26,9 +27,18 @@ pub(crate) struct NacosGrpcClient {
     app_name: String,
     send_request: Arc<dyn SendRequest + Send + Sync + 'static>,
     auth_plugin: Arc<dyn AuthPlugin>,
+    task_owner: TaskOwner,
 }
 
 impl NacosGrpcClient {
+    pub(crate) fn tasks(&self) -> &Arc<TaskGroup> {
+        &self.task_owner.tasks
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.tasks().shutdown().await;
+    }
+
     #[instrument(skip_all)]
     pub(crate) async fn send_request<Request, Response>(
         &self,
@@ -38,6 +48,7 @@ impl NacosGrpcClient {
         Request: GrpcRequestMessage + 'static,
         Response: GrpcResponseMessage + 'static,
     {
+        self.tasks().ensure_running()?;
         let mut request_headers = request.take_headers();
         if let Some(resource) = request.request_resource() {
             let auth_context = self.auth_plugin.get_login_identity(resource);
@@ -314,6 +325,7 @@ impl NacosGrpcClientBuilder {
     }
 
     pub(crate) async fn build(mut self, id: String) -> Result<NacosGrpcClient, Error> {
+        let task_owner = TaskOwner::default();
         self.server_request_handler_map.insert(
             ClientDetectionRequest::identity().to_string(),
             Arc::new(ClientDetectionRequestHandler),
@@ -340,6 +352,7 @@ impl NacosGrpcClientBuilder {
                 self.labels,
                 self.client_abilities,
                 self.max_retries,
+                task_owner.tasks.clone(),
             );
 
             if let Some(connected_listener) = self.connected_listener {
@@ -364,10 +377,7 @@ impl NacosGrpcClientBuilder {
             }
             Err(e) => {
                 if self.emergency_start {
-                    tracing::warn!(
-                        "health check failed, cannot connect to Nacos server, but continuing startup in emergency mode: {}",
-                        e
-                    );
+                    tracing::warn!("health check failed; continuing startup in emergency mode");
                 } else {
                     return Err(e);
                 }
@@ -379,6 +389,7 @@ impl NacosGrpcClientBuilder {
             self.server_list_provider.clone(),
             self.auth_context.clone(),
             id,
+            &task_owner.tasks,
         )
         .await;
 
@@ -389,6 +400,7 @@ impl NacosGrpcClientBuilder {
             app_name,
             send_request,
             auth_plugin,
+            task_owner,
         })
     }
 }
@@ -453,6 +465,7 @@ pub mod tests {
             app_name: "test_app".to_string(),
             send_request: Arc::new(mock_send_request),
             auth_plugin: Arc::new(NoopAuthPlugin::default()),
+            task_owner: TaskOwner::default(),
         };
 
         let response = nacos_grpc_client

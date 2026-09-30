@@ -23,6 +23,7 @@ pub(crate) mod common_remote {
     pub const LABEL_MODULE: &str = "module";
 
     /// LABEL_MODULE value naming
+    #[cfg(feature = "naming")]
     pub const LABEL_MODULE_NAMING: &str = "naming";
 
     /// LABEL_MODULE value config

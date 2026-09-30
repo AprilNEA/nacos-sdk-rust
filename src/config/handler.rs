@@ -19,7 +19,7 @@ impl ServerRequestHandler for ConfigChangeNotifyHandler {
 
         let request = GrpcMessage::<ConfigChangeNotifyRequest>::from_payload(request);
         let Ok(request) = request else {
-            tracing::error!("convert payload to ConfigChangeNotifyRequest error. {request:?}");
+            tracing::error!("ConfigChangeNotifyRequest decoding failed");
             return None;
         };
         let server_req = request.into_body();
@@ -42,7 +42,7 @@ impl ServerRequestHandler for ConfigChangeNotifyHandler {
         let grpc_message = GrpcMessageBuilder::new(response).build();
         let resp_payload = grpc_message.into_payload();
         let Ok(resp_payload) = resp_payload else {
-            tracing::error!("payload conversion failed. {resp_payload:?}");
+            tracing::error!("ConfigChangeNotifyResponse serialization failed");
             return None;
         };
 

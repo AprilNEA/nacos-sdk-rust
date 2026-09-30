@@ -69,6 +69,12 @@ nacos-sdk = { version = "0.8", features = ["default"] }
     }
 ```
 
+#### Close a Config client
+
+Call `config_service.shutdown().await` after the final request. Shutdown cancels and joins configuration polling, authentication refresh, and gRPC workers for every clone of the client. Repeated calls are safe. A listener callback that has already started must return before shutdown completes.
+
+Dropping the final client or cancelling `build()` also cancels the workers. Use `shutdown().await` when the caller must wait for worker cleanup. The shared SDK runtime remains available for other clients.
+
 ### Usage of Naming
 ```rust
     // 请注意！一般情况下，应用下仅需一个 Naming 客户端，而且需要长期持有直至应用停止。
@@ -127,6 +133,8 @@ e.g.
 - env `NACOS_CLIENT_ACCESS_KEY` to set Aliyun ram access-key
 - env `NACOS_CLIENT_SECRET_KEY` to set Aliyun ram access-secret
 - env `NACOS_CLIENT_DISABLE_CACHE_WRITES` to disable config and naming snapshot writes, default false
+
+Property files populate a private SDK map and never modify process environment variables. Values use this priority: process environment, the file selected by `NACOS_CLIENT_PROPS_FILE_PATH`, then the discovered `.env` file. A missing discovered `.env` is allowed. An unreadable explicit file or an invalid file fails client construction. Dotenv interpolation reads the process environment and preceding entries in the same file; values from a separate properties file are not process variables.
 
 #### Disable cache writes
 

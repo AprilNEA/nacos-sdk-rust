@@ -67,37 +67,7 @@ impl AuthPlugin for HttpLoginAuthPlugin {
         };
         let login_url = format!("{scheme}://{server_addr}/nacos/v1/auth/login");
 
-        tracing::debug!("Http login with username={username},password={password}");
-
-        let login_response = {
-            let resp = crate::common::remote::http_client()
-                .post(login_url)
-                .query(&[(USERNAME, username), (PASSWORD, password)])
-                .send()
-                .await;
-            tracing::debug!("Http login resp={resp:?}");
-
-            match resp {
-                Err(e) => {
-                    tracing::error!("Http login error, send response failed, err={e:?}");
-                    None
-                }
-                Ok(resp) => {
-                    let resp_text = resp
-                        .text()
-                        .await
-                        .expect("Response text conversion should succeed");
-                    let resp_obj = serde_json::from_str::<HttpLoginResponse>(&resp_text);
-                    match resp_obj {
-                        Err(e) => {
-                            tracing::error!("Http login error, resp_text={resp_text}, err={e:?}");
-                            None
-                        }
-                        Ok(resp_obj) => Some(resp_obj),
-                    }
-                }
-            }
-        };
+        let login_response = request_login(&login_url, &username, &password).await;
 
         if let Some(login_response) = login_response {
             let delay_sec = login_response.token_ttl / 10;
@@ -117,6 +87,45 @@ impl AuthPlugin for HttpLoginAuthPlugin {
     }
 }
 
+#[tracing::instrument(skip_all, fields(method = "POST", endpoint = "/nacos/v1/auth/login"))]
+async fn request_login(
+    login_url: &str,
+    username: &str,
+    password: &str,
+) -> Option<HttpLoginResponse> {
+    let response = match crate::common::remote::http_client()
+        .post(login_url)
+        .form(&[(USERNAME, username), (PASSWORD, password)])
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(status = ?error.status(), error = %error.without_url(), "HTTP login request failed");
+            return None;
+        }
+    };
+    let status = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%status, error = %error.without_url(), "HTTP login response read failed");
+            return None;
+        }
+    };
+    match serde_json::from_str(&body) {
+        Ok(response) => {
+            tracing::debug!(%status, "HTTP login succeeded");
+            Some(response)
+        }
+        Err(error) => {
+            tracing::error!(%status, category = ?error.classify(), line = error.line(), column = error.column(), "HTTP login response is invalid");
+            None
+        }
+    }
+}
+
 #[derive(Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HttpLoginResponse {
@@ -129,6 +138,93 @@ mod tests {
     use std::sync::Arc;
 
     use crate::api::plugin::{AuthContext, AuthPlugin, HttpLoginAuthPlugin, RequestResource};
+
+    #[tokio::test]
+    async fn login_uses_form_body_and_redacts_response_logs() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, Uri},
+            routing::post,
+        };
+        use tracing::instrument::WithSubscriber;
+
+        for (status, body, succeeds) in [
+            (
+                StatusCode::OK,
+                r#"{"accessToken":"token-sentinel","tokenTtl":18000}"#,
+                true,
+            ),
+            (
+                StatusCode::FORBIDDEN,
+                r#"{"accessToken":"token-sentinel","tokenTtl":18000}"#,
+                false,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"accessToken":"token-sentinel","tokenTtl":"password-sentinel"}"#,
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind local HTTP login test server");
+            let address = listener
+                .local_addr()
+                .expect("read local HTTP login test address");
+            let app = Router::new().route(
+                "/nacos/v1/auth/login",
+                post(
+                    move |uri: Uri, headers: HeaderMap, form: String| async move {
+                        assert!(uri.query().is_none());
+                        assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
+                        let values = url::form_urlencoded::parse(form.as_bytes())
+                            .collect::<std::collections::HashMap<_, _>>();
+                        assert_eq!(values["username"], "username-sentinel +");
+                        assert_eq!(values["password"], "password-sentinel &=");
+                        (status, body)
+                    },
+                ),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve local HTTP login test requests")
+            });
+            let log_path =
+                std::env::temp_dir().join(format!("nacos-auth-log-{}", rand::random::<u64>()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(Arc::new(
+                    std::fs::File::create(&log_path).expect("create HTTP auth test log"),
+                ))
+                .finish();
+            let response = super::request_login(
+                &format!("http://{address}/nacos/v1/auth/login"),
+                "username-sentinel +",
+                "password-sentinel &=",
+            )
+            .with_subscriber(subscriber)
+            .await;
+            assert_eq!(response.is_some(), succeeds);
+            let logs = std::fs::read_to_string(&log_path).expect("read HTTP auth test log");
+            for secret in ["username-sentinel", "password-sentinel", "token-sentinel"] {
+                assert!(
+                    !logs.contains(secret),
+                    "HTTP auth logs must not contain credentials or response values"
+                );
+            }
+            assert!(logs.contains("/nacos/v1/auth/login"));
+            std::fs::remove_file(log_path).expect("remove HTTP auth test log");
+            server.abort();
+            assert!(
+                server
+                    .await
+                    .expect_err("aborted HTTP login test server must stop")
+                    .is_cancelled()
+            );
+        }
+    }
 
     #[tokio::test]
     #[ignore]

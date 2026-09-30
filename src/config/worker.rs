@@ -3,6 +3,7 @@ use crate::api::plugin::{AuthPlugin, ConfigFilter, ConfigReq, ConfigResp};
 use crate::api::props::ClientProps;
 use crate::common::cache::{Cache, CacheBuilder};
 use crate::common::remote::grpc::message::GrpcResponseMessage;
+use crate::common::remote::grpc::task_group::TaskGroup;
 use crate::common::remote::grpc::{NacosGrpcClient, NacosGrpcClientBuilder};
 use crate::common::remote::server_list::create_server_list_provider;
 use crate::config::cache::CacheData;
@@ -15,7 +16,6 @@ use std::sync::Arc;
 
 use tracing::{Instrument, instrument};
 
-#[derive(Clone)]
 pub(crate) struct ConfigWorker {
     pub(crate) client_props: ClientProps,
     remote_client: Arc<NacosGrpcClient>,
@@ -23,7 +23,21 @@ pub(crate) struct ConfigWorker {
     config_filters: Arc<Vec<Box<dyn ConfigFilter>>>,
 }
 
+impl Drop for ConfigWorker {
+    fn drop(&mut self) {
+        self.remote_client.tasks().cancel();
+    }
+}
+
 impl ConfigWorker {
+    pub(crate) fn ensure_running(&self) -> crate::api::error::Result<()> {
+        self.remote_client.tasks().ensure_running()
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.remote_client.shutdown().await;
+    }
+
     pub(crate) async fn new(
         client_props: ClientProps,
         auth_plugin: Arc<dyn AuthPlugin>,
@@ -79,17 +93,21 @@ impl ConfigWorker {
 
         let remote_client = Arc::new(remote_client);
         // todo Event/Subscriber instead of mpsc Sender/Receiver
-        crate::common::executor::spawn(Self::notify_change_to_cache_data(
-            Arc::clone(&remote_client),
-            Arc::clone(&unified_cache),
-            notify_change_rx,
-        ));
+        remote_client
+            .tasks()
+            .spawn(Self::notify_change_to_cache_data(
+                Arc::clone(&remote_client),
+                Arc::clone(&unified_cache),
+                notify_change_rx,
+            ));
 
-        crate::common::executor::spawn(Self::list_ensure_cache_data_newest(
-            Arc::clone(&remote_client),
-            Arc::clone(&unified_cache),
-            notify_change_tx_clone,
-        ));
+        remote_client
+            .tasks()
+            .spawn(Self::list_ensure_cache_data_newest(
+                Arc::clone(&remote_client),
+                Arc::clone(&unified_cache),
+                notify_change_tx_clone,
+            ));
 
         Ok(Self {
             client_props,
@@ -306,10 +324,15 @@ impl ConfigWorker {
             .await;
             match config_resp {
                 Ok(config_resp) => {
-                    Self::fill_data_and_notify(&mut cache_data, config_resp).await;
+                    Self::fill_data_and_notify(
+                        &mut cache_data,
+                        config_resp,
+                        self.remote_client.tasks(),
+                    )
+                    .await;
                 }
-                Err(e) => {
-                    tracing::error!("get_config_inner_async, config_resp err={e:?}");
+                Err(_) => {
+                    tracing::error!("config refresh request failed");
                 }
             }
             let req = ConfigBatchListenRequest::new(true).add_config_listen_context(
@@ -321,7 +344,7 @@ impl ConfigWorker {
                 ),
             );
             let remote_client_clone = self.remote_client.clone();
-            crate::common::executor::spawn(
+            self.remote_client.tasks().spawn(
                 async move {
                     let _ = remote_client_clone
                         .send_request::<ConfigBatchListenRequest, ConfigChangeBatchListenResponse>(
@@ -423,7 +446,7 @@ impl ConfigWorker {
         // Compatibility None < 2.1.0
         cache_data.encrypted_data_key = config_resp.encrypted_data_key.unwrap_or_default();
         cache_data.last_modified = config_resp.last_modified;
-        tracing::info!("fill_data, cache_data={}", cache_data);
+        tracing::debug!("configuration cache updated");
         if cache_data.initializing {
             cache_data.initializing = false;
             false
@@ -432,10 +455,14 @@ impl ConfigWorker {
         }
     }
 
-    async fn fill_data_and_notify(cache_data: &mut CacheData, config_resp: ConfigQueryResponse) {
+    async fn fill_data_and_notify(
+        cache_data: &mut CacheData,
+        config_resp: ConfigQueryResponse,
+        tasks: &TaskGroup,
+    ) {
         if Self::fill_data(cache_data, config_resp) {
             // check md5 and then notify
-            cache_data.notify_listener().await;
+            cache_data.notify_listener(tasks).await;
         }
     }
 
@@ -488,13 +515,13 @@ impl ConfigWorker {
                                 if let Some(snapshot) = snapshot {
                                     let resp = CacheData::filtered_response(snapshot).await;
                                     if let Some(cache_ref) = unified_cache.get(&group_key) {
-                                        cache_ref.dispatch_notify(resp);
+                                        cache_ref.dispatch_notify(resp, remote_client.tasks());
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            tracing::error!("get_config_inner_async, config_resp err={e:?}");
+                        Err(_) => {
+                            tracing::error!("config change refresh request failed");
                         }
                     }
                 }

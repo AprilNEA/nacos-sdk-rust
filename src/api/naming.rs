@@ -316,6 +316,8 @@ impl NamingServiceBuilder {
     }
 
     pub async fn build(self) -> Result<NamingService> {
+        crate::properties::init()?;
+
         #[cfg(feature = "tracing-log")]
         {
             // $HOME/logs/nacos

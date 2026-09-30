@@ -8,8 +8,8 @@ use super::nacos_grpc_service::Callback;
 
 /// Converts a result, logging and returning an error on failure.
 pub(crate) fn convert<T>(result: Result<T, Error>, context: &str) -> Result<T, Error> {
-    result.map_err(|e| {
-        error!("{}: {}", context, e);
+    result.map_err(|_| {
+        error!("{}", context);
         Error::ErrResult(context.to_string())
     })
 }

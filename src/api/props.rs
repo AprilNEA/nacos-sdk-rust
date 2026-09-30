@@ -97,6 +97,7 @@ impl ClientProps {
         }
     }
 
+    #[cfg(feature = "naming")]
     pub(crate) fn get_naming_push_empty_protection(&self) -> bool {
         if self.env_first {
             get_value_bool(
@@ -108,6 +109,7 @@ impl ClientProps {
         }
     }
 
+    #[cfg(feature = "naming")]
     pub(crate) fn get_naming_load_cache_at_start(&self) -> bool {
         if self.env_first {
             get_value_bool(

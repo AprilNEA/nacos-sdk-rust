@@ -29,6 +29,7 @@ pub(crate) fn generate_client_id(
 }
 
 /// Returns the group name or default group if empty.
+#[cfg(feature = "naming")]
 pub(crate) fn normalize_group_name(group_name: Option<String>) -> String {
     group_name
         .filter(|data| !data.is_empty())

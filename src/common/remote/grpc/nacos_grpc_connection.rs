@@ -13,9 +13,9 @@ use tower::buffer::Buffer;
 use tower::{MakeService, Service};
 use tracing::{Instrument, debug, debug_span, error, info, instrument, warn};
 
+use super::task_group::TaskGroup;
 use crate::api::error::Error::ErrResult;
 use crate::api::error::Error::GrpcBufferRequest;
-use crate::common::executor;
 use crate::common::remote::grpc::handlers::default_handler::DefaultHandler;
 use crate::common::remote::grpc::message::request::{
     ConnectionSetupRequest, HealthCheckRequest, NacosClientAbilities, ServerCheckRequest,
@@ -78,6 +78,7 @@ where
     ),
     max_retries: Option<u32>,
     is_initialized: bool,
+    tasks: Arc<TaskGroup>,
 }
 
 impl<M> NacosGrpcConnection<M>
@@ -99,6 +100,7 @@ where
         labels: HashMap<String, String>,
         client_abilities: NacosClientAbilities,
         max_retries: Option<u32>,
+        tasks: Arc<TaskGroup>,
     ) -> Self {
         let connection_id_watcher = watch::channel(None);
 
@@ -118,6 +120,7 @@ where
             connection_id_watcher,
             max_retries,
             is_initialized: false,
+            tasks,
         }
     }
 
@@ -138,7 +141,7 @@ where
             }
             debug!("connected listener quit.");
         };
-        executor::spawn(watch_fu);
+        self.tasks.spawn(watch_fu);
         self
     }
 
@@ -159,7 +162,7 @@ where
             }
             debug!("disconnect listener quit.");
         };
-        executor::spawn(watch_fu);
+        self.tasks.spawn(watch_fu);
         self
     }
 
@@ -169,7 +172,8 @@ where
     ) -> FailoverConnection<NacosGrpcConnection<M>> {
         let svc_health = self.health.clone();
         let svc_last_active = self.last_active.clone();
-        FailoverConnection::new(id, self, svc_health, svc_last_active)
+        let tasks = self.tasks.clone();
+        FailoverConnection::new(id, self, svc_health, svc_last_active, tasks)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -182,6 +186,7 @@ where
         handler_map: Arc<HandlerMap>,
         health: Arc<AtomicBool>,
         last_active: Arc<AtomicU64>,
+        tasks: Arc<TaskGroup>,
     ) -> Result<(M::Service, String), Error> {
         // setup
         let conn_id_sender = NacosGrpcConnection::<M>::setup(
@@ -193,15 +198,17 @@ where
             namespace,
             labels,
             client_abilities,
+            &tasks,
         )
         .in_current_span()
         .await?;
 
         // connection health check
         for i in 0..4 {
-            let health_check = NacosGrpcConnection::<M>::connection_health_check(&mut service)
-                .in_current_span()
-                .await;
+            let health_check =
+                NacosGrpcConnection::<M>::connection_health_check(&mut service, &tasks)
+                    .in_current_span()
+                    .await;
             if health_check.is_err() {
                 sleep(Duration::from_millis(300 << i)).await;
                 continue;
@@ -210,7 +217,7 @@ where
         }
 
         // check server
-        let connection_id = NacosGrpcConnection::<M>::check_server(&mut service)
+        let connection_id = NacosGrpcConnection::<M>::check_server(&mut service, &tasks)
             .in_current_span()
             .await?;
 
@@ -237,6 +244,7 @@ where
         namespace: String,
         labels: HashMap<String, String>,
         client_abilities: NacosClientAbilities,
+        tasks: &TaskGroup,
     ) -> Result<oneshot::Sender<String>, Error> {
         info!("setup connection");
 
@@ -280,17 +288,17 @@ where
         let (cb, rx, mut tk) =
             utils::create_grpc_callback::<Result<GrpcStream<Result<Payload, Error>>, Error>>();
         let call = NacosGrpcCall::BIRequestService((local_stream, cb));
-        executor::spawn(service.call(call).in_current_span());
+        tasks.spawn(service.call(call).in_current_span());
 
         let (conn_id_sender, conn_id_receiver) = oneshot::channel::<String>();
-        executor::spawn(
+        tasks.spawn(
             async move {
                 tk.want();
                 let server_stream =
                     match utils::recv_response(rx.await, "server stream callback failed") {
                         Ok(Ok(stream)) => stream,
-                        Ok(Err(e)) => {
-                            error!("can't open server stream. {}", e);
+                        Ok(Err(_)) => {
+                            error!("cannot open gRPC server stream");
                             warn!("server stream closed!");
                             return;
                         }
@@ -324,15 +332,12 @@ where
                             debug!("response payload type field is empty, skip.");
                             continue;
                         };
-                        debug!("server stream handler: {}", handler_key);
+                        debug!("dispatching gRPC server request");
                         let handler = server_stream_handlers.get(&handler_key).cloned();
                         let handler = handler.unwrap_or_else(|| Arc::new(DefaultHandler));
                         let Some(ret) = handler.request_reply(response).in_current_span().await
                         else {
-                            debug!(
-                                "handler no response, don't need to send to server. skip. key:{}",
-                                handler_key
-                            );
+                            debug!("gRPC server request handler returned no response");
                             continue;
                         };
                         let ret = local_sender_clone.send(ret).await;
@@ -355,7 +360,10 @@ where
         Ok(conn_id_sender)
     }
 
-    async fn connection_health_check(service: &mut M::Service) -> Result<(), Error> {
+    async fn connection_health_check(
+        service: &mut M::Service,
+        tasks: &TaskGroup,
+    ) -> Result<(), Error> {
         info!("connection health check");
 
         let request = utils::convert(
@@ -367,7 +375,7 @@ where
 
         let (cb, rx, mut tk) = utils::create_grpc_callback::<Result<Payload, Error>>();
         let grpc_call = NacosGrpcCall::RequestService((request, cb));
-        executor::spawn(service.call(grpc_call));
+        tasks.spawn(service.call(grpc_call));
 
         tk.want();
         let response = match tokio::time::timeout(HEALTH_CHECK_REQUEST_TIMEOUT, rx).await {
@@ -387,19 +395,16 @@ where
         };
 
         let response = GrpcMessage::<HealthCheckResponse>::from_payload(response);
-        if let Err(e) = response {
+        if response.is_err() {
             let err_msg = "connection health check failed, convert to grpc message failed";
-            warn!(
-                "{}. If the retry is successful, please ignore it: {}",
-                err_msg, e
-            );
+            warn!("connection health check response decoding failed");
             return Err(ErrResult(err_msg.to_string()));
         }
 
         Ok(())
     }
 
-    async fn check_server(service: &mut M::Service) -> Result<String, Error> {
+    async fn check_server(service: &mut M::Service, tasks: &TaskGroup) -> Result<String, Error> {
         info!("check server");
 
         let request = utils::convert(
@@ -411,7 +416,7 @@ where
 
         let (cb, rx, mut tk) = utils::create_grpc_callback::<Result<Payload, Error>>();
         let grpc_call = NacosGrpcCall::RequestService((request, cb));
-        executor::spawn(service.call(grpc_call));
+        tasks.spawn(service.call(grpc_call));
 
         tk.want();
         let response = utils::convert(
@@ -509,16 +514,17 @@ where
                                 self.handler_map.clone(),
                                 self.health.clone(),
                                 self.last_active.clone(),
+                                self.tasks.clone(),
                             ));
                             self.state = State::Initializing(init_future);
                             continue;
                         }
-                        Poll::Ready(Err(e)) => {
+                        Poll::Ready(Err(_)) => {
                             self.retry_count += 1;
                             let sleep_time = sleep_time(self.retry_count);
                             error!(
-                                "create connection error, this operate will be retry after {} sec, retry count:{}. {}",
-                                sleep_time, self.retry_count, e
+                                "create connection failed; retry after {} sec, retry count:{}",
+                                sleep_time, self.retry_count
                             );
                             self.state = State::Retry(Box::pin(sleep(Duration::from_secs(
                                 sleep_time as u64,
@@ -559,12 +565,12 @@ where
                             self.connection_id = Some(connection_id);
                             continue;
                         }
-                        Poll::Ready(Err(e)) => {
+                        Poll::Ready(Err(_)) => {
                             self.retry_count += 1;
                             let sleep_time = sleep_time(self.retry_count);
                             error!(
-                                "initializing connection error, this operate will be retry after {} sec, retry count:{}. {}",
-                                sleep_time, self.retry_count, e
+                                "initializing connection failed; retry after {} sec, retry count:{}",
+                                sleep_time, self.retry_count
                             );
                             self.state = State::Retry(Box::pin(sleep(Duration::from_secs(
                                 sleep_time as u64,
@@ -592,13 +598,13 @@ where
                             }
                             return Poll::Ready(Ok(()));
                         }
-                        Poll::Ready(Err(e)) => {
+                        Poll::Ready(Err(_)) => {
                             self.health.store(false, Ordering::Release);
                             self.retry_count += 1;
                             let sleep_time = sleep_time(self.retry_count);
                             error!(
-                                "connection {:?} not ready, destroy connection and retry, this operate will be retry after {} sec, retry count:{}. {}",
-                                self.connection_id, sleep_time, self.retry_count, e
+                                "connection not ready; retry after {} sec, retry count:{}",
+                                sleep_time, self.retry_count
                             );
                             self.state = State::Retry(Box::pin(sleep(Duration::from_secs(
                                 sleep_time as u64,
@@ -642,7 +648,7 @@ where
                     response
                 }
                 .in_current_span();
-                executor::spawn(call_task);
+                self.tasks.spawn(call_task);
                 ResponseFuture::new(response_fut)
             }
             _ => {
@@ -703,14 +709,15 @@ where
         svc: S,
         svc_health: Arc<AtomicBool>,
         svc_last_active: Arc<AtomicU64>,
+        tasks: Arc<TaskGroup>,
     ) -> Self {
         let (inner, work) = Buffer::pair(svc, 1024);
-        executor::spawn(work);
+        tasks.spawn(work);
 
         let active_health_check = Arc::new(AtomicBool::new(true));
 
         // start health check task
-        executor::spawn(
+        tasks.spawn(
             FailoverConnection::<S>::health_check(
                 inner.clone(),
                 active_health_check.clone(),
@@ -789,8 +796,8 @@ where
                             HEALTH_CHECK_REQUEST_TIMEOUT
                         );
                     }
-                    Ok(Err(e)) => {
-                        error!("health check failed, send health check request failed, retry. {e}");
+                    Ok(Err(_)) => {
+                        error!("health check request failed; retrying");
                     }
                     Ok(Ok(response)) => {
                         if GrpcMessage::<HealthCheckResponse>::from_payload(response).is_ok() {
@@ -893,5 +900,70 @@ pub mod nacos_grpc_connection_tests {
             fn call(&mut self, request: ()) -> <Self as Service<()>>::Future;
 
         }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::common::remote::grpc::task_group::TaskOwner;
+
+    struct PendingService {
+        started: Option<oneshot::Sender<()>>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl Service<Payload> for PendingService {
+        type Response = Payload;
+        type Error = Error;
+        type Future = std::future::Pending<Result<Payload, Error>>;
+
+        fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> Poll<Result<(), Error>> {
+            if let Some(sender) = self.started.take() {
+                sender
+                    .send(())
+                    .expect("test must receive readiness notification");
+            }
+            Poll::Pending
+        }
+
+        fn call(&mut self, _: Payload) -> Self::Future {
+            unreachable!("service never becomes ready")
+        }
+    }
+
+    impl Drop for PendingService {
+        fn drop(&mut self) {
+            if let Some(sender) = self.dropped.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_transport_and_releases_pending_request() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let owner = TaskOwner::default();
+            let (started_tx, started_rx) = oneshot::channel();
+            let (dropped_tx, dropped_rx) = oneshot::channel();
+            let connection = FailoverConnection::new(
+                "shutdown-test".to_owned(),
+                PendingService {
+                    started: Some(started_tx),
+                    dropped: Some(dropped_tx),
+                },
+                Arc::new(AtomicBool::new(true)),
+                Arc::new(AtomicU64::new(now_millis())),
+                owner.tasks.clone(),
+            );
+            let request =
+                tokio::spawn(async move { connection.send_request(Payload::default()).await });
+            started_rx.await.expect("transport must receive request");
+            owner.tasks.shutdown().await;
+            dropped_rx.await.expect("shutdown must release transport");
+            assert!(request.await.expect("request task must finish").is_err());
+        })
+        .await
+        .expect("shutdown must stop pending transport and health loop");
     }
 }

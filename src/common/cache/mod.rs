@@ -185,6 +185,7 @@ where
 }
 
 const CONFIG_MODULE: &str = "config";
+#[cfg(feature = "naming")]
 const NAMING_MODULE: &str = "naming";
 
 impl<V> CacheBuilder<V>
@@ -201,6 +202,7 @@ where
         }
     }
 
+    #[cfg(feature = "naming")]
     pub(crate) fn naming(namespace: String) -> Self {
         Self {
             _mark: Default::default(),
@@ -260,14 +262,18 @@ trait Store<V>: Send + Sync {
 pub mod tests {
     use std::time::Duration;
 
-    use crate::{common::cache::Cache, test_config};
+    use crate::common::cache::Cache;
+    #[cfg(feature = "naming")]
+    use crate::test_config;
 
     use super::CacheBuilder;
 
+    #[cfg(feature = "naming")]
     fn setup() {
         test_config::setup_log();
     }
 
+    #[cfg(feature = "naming")]
     #[tokio::test]
     pub async fn test_cache() {
         setup();
@@ -411,6 +417,7 @@ pub mod tests {
                 "config",
                 CacheBuilder::<String>::config("namespace".to_string()),
             ),
+            #[cfg(feature = "naming")]
             (
                 "naming",
                 CacheBuilder::<String>::naming("namespace".to_string()),

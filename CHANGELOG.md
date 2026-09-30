@@ -2,10 +2,18 @@
 
 ### Unreleased
 
+- 修复：属性文件不再修改进程环境；显式文件读取失败或文件语法错误会终止客户端初始化。
+- 修复：HTTP 认证使用表单请求体，并从认证日志中移除凭据、token、请求 URL 和响应正文。
+- 修复：配置与 gRPC 异常日志不再输出 payload、headers 或服务器返回的原始错误内容。
+- 特性：增加 `ConfigService::shutdown`，关闭配置、认证和 gRPC 后台任务；丢弃最后一个客户端或取消构建也会取消任务。
 - 特性：增加 `ClientProps::disable_cache_writes` 与 `NACOS_CLIENT_DISABLE_CACHE_WRITES`，禁止配置与服务发现快照写入磁盘，保留缓存读取和内存更新。
 
 ---
 
+- Fix: load property files without modifying process environment variables; fail construction for unreadable explicit files or invalid files.
+- Fix: send HTTP authentication credentials in a form body and exclude credentials, tokens, request URLs, and response bodies from authentication logs.
+- Fix: exclude payloads, headers, and raw server errors from config and gRPC diagnostic logs.
+- Feature: add `ConfigService::shutdown` to cancel and join config, authentication, and gRPC workers; dropping the final client or cancelling construction also cancels workers.
 - Feature: add `ClientProps::disable_cache_writes` and `NACOS_CLIENT_DISABLE_CACHE_WRITES` to disable config and naming snapshot writes while preserving cache reads and in-memory updates.
 
 ### 0.8.3
@@ -324,4 +332,3 @@
 
 - The module of Config basically available
 - Welcome more contributions, fixes and standardized APIs
-

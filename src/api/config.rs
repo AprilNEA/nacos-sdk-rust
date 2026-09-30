@@ -27,6 +27,14 @@ pub struct ConfigService {
 }
 
 impl ConfigService {
+    /// Stop this client and all its clones, then wait for background tasks to finish.
+    ///
+    /// Repeated calls are safe. An already running synchronous listener must return
+    /// before shutdown completes. Dropping the last clone cancels tasks without waiting.
+    pub async fn shutdown(&self) {
+        self.inner.shutdown().await;
+    }
+
     /// Get config, return the content.
     ///
     /// Attention to [`error::Error::ConfigNotFound`], [`error::Error::ConfigQueryConflict`]
@@ -35,6 +43,7 @@ impl ConfigService {
         data_id: String,
         group: String,
     ) -> error::Result<ConfigResponse> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         self.inner.get_config(data_id, group).await
@@ -48,6 +57,7 @@ impl ConfigService {
         content: String,
         content_type: Option<String>,
     ) -> error::Result<bool> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         crate::common::util::check_not_blank(&content, "content")?;
@@ -65,6 +75,7 @@ impl ConfigService {
         content_type: Option<String>,
         cas_md5: String,
     ) -> error::Result<bool> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         crate::common::util::check_not_blank(&content, "content")?;
@@ -83,6 +94,7 @@ impl ConfigService {
         content_type: Option<String>,
         beta_ips: String,
     ) -> error::Result<bool> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         crate::common::util::check_not_blank(&content, "content")?;
@@ -102,6 +114,7 @@ impl ConfigService {
         cas_md5: Option<String>,
         params: HashMap<String, String>,
     ) -> error::Result<bool> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         crate::common::util::check_not_blank(&content, "content")?;
@@ -112,6 +125,7 @@ impl ConfigService {
 
     /// Remove config, return true/false.
     pub async fn remove_config(&self, data_id: String, group: String) -> error::Result<bool> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         self.inner.remove_config(data_id, group).await
@@ -124,6 +138,7 @@ impl ConfigService {
         group: String,
         listener: Arc<dyn ConfigChangeListener>,
     ) -> error::Result<()> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         self.inner.add_listener(data_id, group, listener).await
@@ -136,6 +151,7 @@ impl ConfigService {
         group: String,
         listener: Arc<dyn ConfigChangeListener>,
     ) -> error::Result<()> {
+        self.inner.ensure_running()?;
         crate::common::util::check_not_blank(&data_id, "data_id")?;
         crate::common::util::check_not_blank(&group, "group")?;
         self.inner.remove_listener(data_id, group, listener).await
@@ -328,6 +344,7 @@ impl ConfigServiceBuilder {
 
     /// Builds a new [`ConfigService`].
     pub async fn build(self) -> error::Result<ConfigService> {
+        crate::properties::init()?;
         #[cfg(feature = "tracing-log")]
         {
             // $HOME/logs/nacos

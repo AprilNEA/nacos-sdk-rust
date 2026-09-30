@@ -173,17 +173,14 @@ fn unary_request(
             .in_current_span()
             .await;
         if let Err(e) = ready {
-            error!("unary request service is not ready.{e}");
+            error!("unary request service is not ready");
             return Err(e);
         }
 
         let response = service.call(payload).in_current_span().await;
         let send_ret = cb.send(response).await;
-        if let Err(e) = send_ret {
-            error!(
-                "unary_request failed, callback can not invoke, send error. {}",
-                e
-            );
+        if send_ret.is_err() {
+            error!("unary request callback is closed");
             return Err(Error::ErrResult(
                 "unary_request failed, callback can not invoke, send error.".to_string(),
             ));
@@ -215,18 +212,15 @@ fn bi_request(
             .in_current_span()
             .await;
         if let Err(e) = ready {
-            error!("bi request service is not ready. {e}");
+            error!("bidirectional request service is not ready");
             return Err(e);
         }
 
         let response = service.call(stream).in_current_span().await;
 
         let send_ret = cb.send(response).await;
-        if let Err(e) = send_ret {
-            error!(
-                "bi_request failed, callback can not invoke, send error. {}",
-                e
-            );
+        if send_ret.is_err() {
+            error!("bidirectional request callback is closed");
             return Err(Error::ErrResult(
                 "bi_request failed, callback can not invoke, send error.".to_string(),
             ));
@@ -404,7 +398,7 @@ impl Future for GrpcCallTask {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(ret)) => Poll::Ready(Ok(ret)),
             Poll::Ready(Err(e)) => {
-                error!("grpc call task get an error: {e}");
+                error!("gRPC call failed");
                 Poll::Ready(Err(e))
             }
         }

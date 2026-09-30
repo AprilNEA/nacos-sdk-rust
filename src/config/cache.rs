@@ -1,6 +1,7 @@
 use crate::api::config::ConfigResponse;
 use crate::api::plugin::ConfigFilter;
 use crate::api::plugin::ConfigResp;
+use crate::common::remote::grpc::task_group::TaskGroup;
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -82,14 +83,14 @@ impl CacheData {
     ///
     /// NOTE: never call while holding a DashMap guard — it awaits (config filters),
     /// and a guard held across an await can deadlock the SDK runtime.
-    pub async fn notify_listener(&mut self) {
+    pub async fn notify_listener(&mut self, tasks: &TaskGroup) {
         let config_resp = self.get_config_resp_after_filter().await;
-        self.dispatch_notify(config_resp);
+        self.dispatch_notify(config_resp, tasks);
     }
 
     /// Dispatch notification synchronously: compare last_md5 and notify in an
     /// independent task. Never awaits, safe to call while holding a lock.
-    pub(crate) fn dispatch_notify(&self, config_resp: ConfigResponse) {
+    pub(crate) fn dispatch_notify(&self, config_resp: ConfigResponse, tasks: &TaskGroup) {
         tracing::info!(
             "dispatch_notify, dataId={},group={},namespace={},md5={}",
             self.data_id,
@@ -106,7 +107,7 @@ impl CacheData {
                 // Notify when last-md5 not equals the-newest-md5, Notify in independent thread.
                 let l_clone = listen_wrap.listener.clone();
                 let c_clone = config_resp.clone();
-                crate::common::executor::spawn(async move {
+                tasks.spawn(async move {
                     l_clone.notify(c_clone);
                 });
                 listen_wrap.last_md5 = self.md5.clone();
@@ -201,6 +202,7 @@ impl ListenerWrapper {
 #[cfg(test)]
 mod tests {
     use crate::api::config::{ConfigChangeListener, ConfigResponse};
+    use crate::common::remote::grpc::task_group::TaskGroup;
     use crate::config::cache::CacheData;
     use std::sync::Arc;
 
@@ -357,7 +359,7 @@ mod tests {
                 .expect("entry should exist");
             let resp = CacheData::filtered_response(snapshot).await;
             if let Some(r) = cache_in_task.get(&key_in_task) {
-                r.dispatch_notify(resp);
+                r.dispatch_notify(resp, &TaskGroup::default());
             }
         });
 

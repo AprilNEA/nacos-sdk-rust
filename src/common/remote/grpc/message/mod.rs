@@ -10,33 +10,6 @@ use crate::api::plugin::RequestResource;
 use crate::common::remote::grpc::message::response::ErrorResponse;
 use crate::nacos_proto::v2::{Metadata, Payload};
 
-/// Helper macro to convert payload body to target type with consistent error handling.
-/// Logs the payload content if conversion fails for easier debugging.
-macro_rules! try_convert_payload {
-    ($result:expr, $body_any:expr, $target_type:expr) => {
-        match $result {
-            Ok(value) => value,
-            Err(error) => {
-                match std::str::from_utf8(&$body_any.value) {
-                    Ok(payload_str) => {
-                        error!(
-                            "payload {} can not convert to {} occur an error:{:?}",
-                            payload_str, $target_type, error
-                        );
-                    }
-                    Err(_) => {
-                        error!(
-                            "can not convert to target type {}, this payload can not convert to string as well",
-                            $target_type
-                        );
-                    }
-                }
-                return Err(error);
-            }
-        }
-    };
-}
-
 pub(crate) mod request;
 pub(crate) mod response;
 
@@ -73,7 +46,7 @@ where
         let body = match self.body.to_proto_any() {
             Ok(proto_any) => proto_any,
             Err(error) => {
-                error!("Serialize GrpcMessageBody occur an error: {:?}", error);
+                error!(target_type = %T::identity(), "gRPC message serialization failed");
                 return Err(error);
             }
         };
@@ -99,8 +72,7 @@ where
         // try to serialize target type if r_type is not empty
         if !r_type.is_empty() {
             if T::identity().eq(&r_type) {
-                let ret: Result<T> = T::from_proto_any(&body_any);
-                let de_body = try_convert_payload!(ret, body_any, T::identity());
+                let de_body = T::from_proto_any(&body_any)?;
                 return Ok(GrpcMessage {
                     headers,
                     body: de_body,
@@ -110,12 +82,10 @@ where
 
             // type mismatch - try to convert to ErrorResponse
             warn!(
-                "payload type {}, target type {}, trying convert to ErrorResponse",
-                &r_type,
-                T::identity()
+                target_type = %T::identity(),
+                "gRPC payload type mismatch; trying ErrorResponse"
             );
-            let ret: Result<ErrorResponse> = ErrorResponse::from_proto_any(&body_any);
-            let error_response = try_convert_payload!(ret, body_any, "ErrorResponse");
+            let error_response: ErrorResponse = ErrorResponse::from_proto_any(&body_any)?;
             return Err(ErrResponse(
                 error_response.request_id,
                 error_response.result_code,
@@ -135,16 +105,8 @@ where
             });
         }
 
-        // direct conversion failed - log warning and try ErrorResponse
+        // A server can omit the message type for ErrorResponse.
         let error = ret.unwrap_err();
-        if let Ok(payload_str) = std::str::from_utf8(&body_any.value) {
-            warn!(
-                "payload {} can not convert to {} occur an error:{:?}",
-                payload_str,
-                T::identity(),
-                error
-            );
-        }
 
         let ret: Result<ErrorResponse> = ErrorResponse::from_proto_any(&body_any);
         if let Ok(error_response) = ret {
@@ -157,10 +119,7 @@ where
         }
 
         // both conversions failed - return original error
-        error!(
-            "trying convert to ErrorResponse occur an error:{:?}",
-            ret.unwrap_err()
-        );
+        error!("gRPC payload cannot be decoded as ErrorResponse");
         Err(error)
     }
 }
@@ -188,6 +147,7 @@ pub(crate) trait GrpcMessageData:
         let body = match serde_json::from_slice(&any.value) {
             Ok(data) => data,
             Err(error) => {
+                error!(target_type = %T::identity(), category = ?error.classify(), line = error.line(), column = error.column(), "gRPC payload decoding failed");
                 return Err(Serialization(error));
             }
         };
@@ -262,5 +222,61 @@ where
             body: self.body,
             client_ip: self.client_ip,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::remote::grpc::handlers::default_handler::DefaultHandler;
+    use crate::common::remote::grpc::nacos_grpc_service::ServerRequestHandler;
+    use std::sync::Arc;
+    use tracing::instrument::WithSubscriber;
+
+    #[tokio::test]
+    async fn malformed_and_unknown_payload_logs_exclude_body_and_headers() {
+        let log_path =
+            std::env::temp_dir().join(format!("nacos-grpc-log-{}", rand::random::<u64>()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(Arc::new(
+                std::fs::File::create(&log_path).expect("create gRPC payload test log"),
+            ))
+            .finish();
+        async {
+            for message_type in ["ErrorResponse", "", "type-sentinel"] {
+                let payload = Payload {
+                    metadata: Some(Metadata {
+                        r#type: message_type.to_string(),
+                        client_ip: "client-sentinel".to_string(),
+                        headers: HashMap::from([("accessToken".to_string(), "token-sentinel".to_string())]),
+                    }),
+                    body: Some(Any {
+                        type_url: "type-sentinel".to_string(),
+                        value: br#"{"resultCode":"token-sentinel","content":"password: yaml-sentinel"}"#.to_vec(),
+                    }),
+                };
+                let error = GrpcMessage::<ErrorResponse>::from_payload(payload.clone()).expect_err("malformed server response must fail decoding");
+                assert!(crate::common::remote::grpc::utils::convert::<()>(Err(error), "config response conversion failed").is_err());
+                assert!(DefaultHandler.request_reply(payload).await.is_none());
+            }
+        }.with_subscriber(subscriber).await;
+
+        let logs = std::fs::read_to_string(&log_path).expect("read gRPC payload test log");
+        for secret in [
+            "yaml-sentinel",
+            "token-sentinel",
+            "type-sentinel",
+            "client-sentinel",
+        ] {
+            assert!(
+                !logs.contains(secret),
+                "gRPC logs must exclude response content and credentials"
+            );
+        }
+        assert!(logs.contains("gRPC payload decoding failed"));
+        assert!(logs.contains("unknown gRPC server request ignored"));
+        std::fs::remove_file(log_path).expect("remove gRPC payload test log");
     }
 }

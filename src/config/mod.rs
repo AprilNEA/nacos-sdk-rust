@@ -47,6 +47,14 @@ const MODULE_NAME: &str = "config";
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl NacosConfigService {
+    pub(crate) fn ensure_running(&self) -> crate::api::error::Result<()> {
+        self.client_worker.ensure_running()
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.client_worker.shutdown().await;
+    }
+
     pub async fn new(
         client_props: ClientProps,
         auth_plugin: std::sync::Arc<dyn AuthPlugin>,
